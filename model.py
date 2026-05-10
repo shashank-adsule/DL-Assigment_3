@@ -484,7 +484,7 @@ class Transformer(nn.Module):
     # ── Greedy decoding (used during inference) ───────────────────────────────
 
     @torch.no_grad()
-    def infer(self, src, bos_idx: int, eos_idx: int,
+    def infer(self, src, bos_idx: int = 1, eos_idx: int = 2,
               pad_idx: int = 0, max_len: int = 100):
         """
         Greedy decoding: generate one token at a time by always picking the
