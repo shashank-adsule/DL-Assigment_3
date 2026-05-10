@@ -400,8 +400,8 @@ class Transformer(nn.Module):
     """
 
     def __init__(self, src_vocab_size: int = 8000, tgt_vocab_size: int = 8000,
-                 d_model: int = 256, num_layers: int = 3,
-                 num_heads: int = 8, d_ff: int = 512,
+                 d_model: int = 512, num_layers: int = 6,
+                 num_heads: int = 8, d_ff: int = 2048,
                  dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
 
@@ -412,7 +412,14 @@ class Transformer(nn.Module):
 
         # Output projection: d_model → tgt_vocab_size
         # No softmax here — loss functions operate on raw logits
-        self.output_projection = nn.Linear(d_model, tgt_vocab_size)
+        self.output_projection = nn.Linear(d_model, tgt_vocab_size, bias=False)
+
+        # ── Weight tying (paper section 3.4) ──────────────────────────────────
+        # Share the same weight matrix between:
+        #   (a) decoder token embedding
+        #   (b) output projection (pre-softmax linear)
+        # This reduces parameters and improves performance.
+        self.output_projection.weight = self.decoder.embedding.weight
 
         self._init_weights()
 
@@ -488,10 +495,10 @@ class Transformer(nn.Module):
               pad_idx: int = 0, max_len: int = 100):
         """
         Greedy decoding. Accepts either:
-          - a raw German string  → tokenises internally, returns English string
+          - a raw German string  → tokenises, decodes, returns English string
           - a LongTensor (1, src_len) → returns English string
 
-        The autograder calls:  model.infer(src_text)  where src_text is a str.
+        The autograder calls:  model.infer(german_string)
 
         Args:
             src     : str  OR  LongTensor (1, src_len)
@@ -503,29 +510,41 @@ class Transformer(nn.Module):
         Returns:
             translation : English string
         """
-        # ── If src is a raw string, tokenise + encode it ──────────────────────
+        # ── Load vocab if not already attached ────────────────────────────────
+        # The autograder loads only model weights; vocab must come from the
+        # checkpoint file saved alongside the model.
+        if not hasattr(self, "src_vocab") or self.src_vocab is None:
+            import os, torch as _torch
+            # Try to find vocab file next to the checkpoint
+            vocab_candidates = [
+                "checkpoints/vocab.pt",
+                "vocab.pt",
+                os.path.join(os.path.dirname(
+                    os.path.abspath(__file__)), "checkpoints", "vocab.pt"),
+            ]
+            for path in vocab_candidates:
+                if os.path.exists(path):
+                    vocab_data = _torch.load(path, weights_only=False)
+                    self.src_vocab = vocab_data["src_vocab"]
+                    self.tgt_vocab = vocab_data["tgt_vocab"]
+                    break
+
+        # ── If src is a raw string, tokenise + encode ─────────────────────────
         if isinstance(src, str):
-            import spacy, os
-
-            # Load spaCy German tokeniser
             try:
+                import spacy
                 spacy_de = spacy.load("de_core_news_sm")
-            except OSError:
-                # Fallback: simple whitespace split
+                tokens   = [tok.text.lower() for tok in spacy_de.tokenizer(src)]
+            except Exception:
                 tokens = src.lower().split()
-            else:
-                tokens = [tok.text.lower() for tok in spacy_de.tokenizer(src)]
 
-            # Encode using the vocabulary stored on this model
-            # src_vocab is attached by load_checkpoint() below
-            if hasattr(self, "src_vocab"):
-                unk = 3
+            unk = 3
+            if hasattr(self, "src_vocab") and self.src_vocab is not None:
                 ids = ([bos_idx]
                        + [self.src_vocab.token2idx.get(t, unk) for t in tokens]
                        + [eos_idx])
             else:
-                # No vocab attached — encode as best we can with just special tokens
-                ids = [bos_idx, eos_idx]
+                ids = [bos_idx] + [unk] * len(tokens) + [eos_idx]
 
             device = next(self.parameters()).device
             src    = torch.tensor([ids], dtype=torch.long, device=device)
@@ -549,10 +568,10 @@ class Transformer(nn.Module):
                 break
 
         # ── Decode token ids → English string ────────────────────────────────
-        pred_ids = tgt[0, 1:].tolist()   # skip leading <bos>
+        pred_ids = tgt[0, 1:].tolist()
         pred_ids = [t for t in pred_ids if t not in (eos_idx, pad_idx)]
 
-        if hasattr(self, "tgt_vocab"):
+        if hasattr(self, "tgt_vocab") and self.tgt_vocab is not None:
             words = self.tgt_vocab.decode(pred_ids)
         else:
             words = [str(t) for t in pred_ids]

@@ -226,3 +226,4 @@ temp/*
 temp.*
 
 # checkpoints
+checkpoints/

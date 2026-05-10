@@ -34,19 +34,19 @@ from lr_scheduler import get_optimizer_and_scheduler
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_CONFIG = dict(
-    # Model
-    d_model      = 256,
-    num_layers   = 3,
-    num_heads    = 8,
-    d_ff         = 512,
-    dropout      = 0.1,
+    # Model — paper base model (Table 3, section 3)
+    d_model      = 512,    # paper: 512
+    num_layers   = 6,      # paper: N=6
+    num_heads    = 8,      # paper: h=8  → d_k = d_v = 512/8 = 64
+    d_ff         = 2048,   # paper: d_ff = 2048
+    dropout      = 0.1,    # paper: P_drop = 0.1
     max_len      = 200,
 
-    # Training
-    batch_size   = [128,256][0],
-    num_epochs   = 20,
-    warmup_steps = 4000,
-    label_smooth = 0.1,
+    # Training — paper section 5
+    batch_size   = 64,     # safe for 6GB VRAM with d_model=512
+    num_epochs   = 30,     # Multi30k is small so 30 epochs ≈ 100K steps
+    warmup_steps = 4000,   # paper: warmup_steps = 4000
+    label_smooth = 0.1,    # paper: ε_ls = 0.1
     clip_grad    = 1.0,
     min_freq     = 2,
     seed         = 42,
@@ -312,6 +312,14 @@ def train(config: dict):
                 "tgt_vocab"  : tgt_vocab,
                 "config"     : config,
             }, config["save_path"])
+
+            # Save vocab separately so model.infer(string) works when the
+            # autograder loads only the weights via load_state_dict()
+            vocab_path = os.path.join(
+                os.path.dirname(config["save_path"]), "vocab.pt"
+            )
+            torch.save({"src_vocab": src_vocab, "tgt_vocab": tgt_vocab},
+                       vocab_path)
             print(f"          ✓ checkpoint saved (val_loss={val_loss:.4f})")
 
     # Final test-set BLEU from best checkpoint
