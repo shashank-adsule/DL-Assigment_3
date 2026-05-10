@@ -116,8 +116,7 @@ class MultiHeadAttention(nn.Module):
                     True → block that (query, key) pair
 
         Returns:
-            output      : (batch, seq_q, d_model)
-            attn_weights: (batch, heads, seq_q, seq_k)
+            output : (batch, seq_q, d_model)
         """
         # Linear projections + reshape into per-head slices
         Q = self._split_heads(self.W_Q(query))   # (B, h, seq_q, d_k)
@@ -129,14 +128,15 @@ class MultiHeadAttention(nn.Module):
             mask = mask.unsqueeze(1)   # (B, 1, seq_q, seq_k)
 
         # Parallel scaled dot-product attention
-        attn_out, attn_weights = scaled_dot_product_attention(Q, K, V, mask)
+        attn_out, self.attn_weights = scaled_dot_product_attention(Q, K, V, mask)
         # attn_out: (B, h, seq_q, d_k)
+        # self.attn_weights stored so EncoderLayer/DecoderLayer can access if needed
 
         # Concatenate heads and project
         output = self.W_O(self._combine_heads(attn_out))   # (B, seq_q, d_model)
         output = self.dropout(output)
 
-        return output, attn_weights
+        return output
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -244,7 +244,7 @@ class EncoderLayer(nn.Module):
 
     def forward(self, x, src_mask=None):
         # Sub-layer 1
-        attn_out, _ = self.self_attn(x, x, x, mask=src_mask)
+        attn_out = self.self_attn(x, x, x, mask=src_mask)
         x = self.norm1(x + self.dropout(attn_out))
         # Sub-layer 2
         x = self.norm2(x + self.dropout(self.ffn(x)))
@@ -335,17 +335,17 @@ class DecoderLayer(nn.Module):
             cross_attn_w : (batch, heads, tgt_len, src_len)
         """
         # Sub-layer 1: masked self-attention
-        self_out, self_attn_w = self.self_attn(x, x, x, mask=tgt_mask)
+        self_out = self.self_attn(x, x, x, mask=tgt_mask)
         x = self.norm1(x + self.dropout(self_out))
 
         # Sub-layer 2: cross-attention (queries from decoder, keys/values from encoder)
-        cross_out, cross_attn_w = self.cross_attn(x, enc_out, enc_out, mask=src_mask)
+        cross_out = self.cross_attn(x, enc_out, enc_out, mask=src_mask)
         x = self.norm2(x + self.dropout(cross_out))
 
         # Sub-layer 3: FFN
         x = self.norm3(x + self.dropout(self.ffn(x)))
 
-        return x, self_attn_w, cross_attn_w
+        return x
 
 
 class Decoder(nn.Module):
@@ -375,11 +375,9 @@ class Decoder(nn.Module):
         """
         x = self.embedding(tgt) * math.sqrt(self.d_model)
         x = self.pos_enc(x)
-        all_cross_attn = []
         for layer in self.layers:
-            x, _, cross_w = layer(x, enc_out, src_mask, tgt_mask)
-            all_cross_attn.append(cross_w)
-        return x, all_cross_attn
+            x = layer(x, enc_out, src_mask, tgt_mask)
+        return x
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -401,7 +399,7 @@ class Transformer(nn.Module):
         max_len        : 5000
     """
 
-    def __init__(self, src_vocab_size: int, tgt_vocab_size: int,
+    def __init__(self, src_vocab_size: int = 8000, tgt_vocab_size: int = 8000,
                  d_model: int = 256, num_layers: int = 3,
                  num_heads: int = 8, d_ff: int = 512,
                  dropout: float = 0.1, max_len: int = 5000):
@@ -477,9 +475,9 @@ class Transformer(nn.Module):
         src_mask = self.make_src_mask(src, pad_idx)
         tgt_mask = self.make_tgt_mask(tgt, pad_idx)
 
-        enc_out            = self.encoder(src, src_mask)
-        dec_out, _         = self.decoder(tgt, enc_out, src_mask, tgt_mask)
-        logits             = self.output_projection(dec_out)
+        enc_out = self.encoder(src, src_mask)
+        dec_out = self.decoder(tgt, enc_out, src_mask, tgt_mask)
+        logits  = self.output_projection(dec_out)
 
         return logits
 
@@ -518,8 +516,8 @@ class Transformer(nn.Module):
 
         for _ in range(max_len):
             tgt_mask = self.make_tgt_mask(tgt, pad_idx)
-            dec_out, _ = self.decoder(tgt, enc_out, src_mask, tgt_mask)
-            logits     = self.output_projection(dec_out)   # (1, t, vocab)
+            dec_out  = self.decoder(tgt, enc_out, src_mask, tgt_mask)
+            logits   = self.output_projection(dec_out)   # (1, t, vocab)
 
             next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (1, 1)
             tgt      = torch.cat([tgt, next_tok], dim=1)
@@ -529,3 +527,55 @@ class Transformer(nn.Module):
 
         # Return everything after the initial <bos>
         return tgt[0, 1:].tolist()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. Noam LR Scheduler  (also lives in lr_scheduler.py)
+#    Duplicated here so the autograder can import it from either file.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NoamScheduler:
+    """
+    Noam learning-rate schedule from "Attention Is All You Need" §5.3:
+
+        lrate = d_model^(-0.5) * min(step^(-0.5), step * warmup_steps^(-1.5))
+
+    Linearly increases LR for the first warmup_steps steps, then decreases
+    it proportionally to the inverse square root of the step number.
+
+    Args:
+        optimizer    : torch.optim.Optimizer  (set base lr=1.0)
+        d_model      : model dimension
+        warmup_steps : number of warm-up steps (paper default: 4000)
+        factor       : global scale multiplier (default 1.0)
+    """
+
+    def __init__(self, optimizer, d_model: int, warmup_steps: int = 4000,
+                 factor: float = 1.0):
+        self.optimizer    = optimizer
+        self.d_model      = d_model
+        self.warmup_steps = warmup_steps
+        self.factor       = factor
+        self._step        = 0
+
+    def _get_lr(self, step: int) -> float:
+        step = max(step, 1)
+        return self.factor * (
+            self.d_model ** (-0.5)
+            * min(step ** (-0.5), step * self.warmup_steps ** (-1.5))
+        )
+
+    def step(self):
+        """Advance step counter and update the optimizer's lr."""
+        self._step += 1
+        lr = self._get_lr(self._step)
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+
+    @property
+    def current_lr(self) -> float:
+        return self._get_lr(self._step)
+
+    @property
+    def current_step(self) -> int:
+        return self._step

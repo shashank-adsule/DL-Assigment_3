@@ -13,7 +13,6 @@ Special token indices (imported by every other module):
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
-from datasets import load_dataset
 import spacy
 from collections import Counter
 
@@ -156,18 +155,36 @@ def collate_fn(batch):
 
 def get_dataset(batch_size: int = 128, min_freq: int = 2, max_len: int = 150):
     """
-    Download Multi30k, build vocabularies, return DataLoaders and vocab objects.
+    Load Multi30k from HuggingFace JSONL files, build vocabularies,
+    return DataLoaders and vocab objects.
 
     Vocabularies are built on TRAINING data only (no data leakage).
 
     Returns:
         train_loader, val_loader, test_loader, src_vocab, tgt_vocab
     """
-    print("Downloading Multi30k …")
-    dataset   = load_dataset("bentrevett/multi30k")
-    train_raw = dataset["train"]
-    val_raw   = dataset["validation"]
-    test_raw  = dataset["test"]
+    import pandas as pd
+
+    print("Loading Multi30k …")
+    splits = {
+        "train"     : "train.jsonl",
+        "validation": "val.jsonl",
+        "test"      : "test.jsonl",
+    }
+
+    # Load each split as a list of dicts with keys "de" and "en"
+    train_raw = pd.read_json(
+        "hf://datasets/bentrevett/multi30k/" + splits["train"],
+        lines=True
+    ).to_dict("records")
+    val_raw   = pd.read_json(
+        "hf://datasets/bentrevett/multi30k/" + splits["validation"],
+        lines=True
+    ).to_dict("records")
+    test_raw  = pd.read_json(
+        "hf://datasets/bentrevett/multi30k/" + splits["test"],
+        lines=True
+    ).to_dict("records")
 
     print("Loading spaCy models …")
     spacy_de, spacy_en = load_spacy_models()
