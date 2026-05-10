@@ -223,3 +223,6 @@ __marimo__/
 wandb/
 
 temp/*
+temp.*
+
+# checkpoints

@@ -316,7 +316,7 @@ def train(config: dict):
 
     # Final test-set BLEU from best checkpoint
     print("\nEvaluating on test set …")
-    ckpt = torch.load(config["save_path"], map_location=device)
+    ckpt = torch.load(config["save_path"], map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     test_bleu = compute_bleu(model, test_loader, tgt_vocab, device)
     print(f"Test BLEU: {test_bleu:.2f}")
@@ -333,7 +333,7 @@ def translate(checkpoint_path: str, sentence: str, max_len: int = 100):
     from dataset import load_spacy_models, tokenize_de
 
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt      = torch.load(checkpoint_path, map_location=device)
+    ckpt      = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg       = ckpt["config"]
     src_vocab = ckpt["src_vocab"]
     tgt_vocab = ckpt["tgt_vocab"]
