@@ -43,7 +43,7 @@ DEFAULT_CONFIG = dict(
     max_len      = 200,
 
     # Training
-    batch_size   = 128,
+    batch_size   = [128,256][0],
     num_epochs   = 20,
     warmup_steps = 4000,
     label_smooth = 0.1,
