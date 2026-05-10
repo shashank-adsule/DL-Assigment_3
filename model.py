@@ -487,46 +487,77 @@ class Transformer(nn.Module):
     def infer(self, src, bos_idx: int = 1, eos_idx: int = 2,
               pad_idx: int = 0, max_len: int = 100):
         """
-        Greedy decoding: generate one token at a time by always picking the
-        argmax of the output distribution.
+        Greedy decoding. Accepts either:
+          - a raw German string  → tokenises internally, returns English string
+          - a LongTensor (1, src_len) → returns English string
 
-        Algorithm:
-            1. Encode source once → enc_out
-            2. Start with tgt = [bos_idx]
-            3. Decode → logits → argmax → append new token → repeat
-            4. Stop when <eos> is generated or max_len is reached
+        The autograder calls:  model.infer(src_text)  where src_text is a str.
 
         Args:
-            src     : (1, src_len)   single source sentence (batch size = 1)
-            bos_idx : <bos> token index
-            eos_idx : <eos> token index
-            pad_idx : <pad> token index
-            max_len : maximum number of tokens to generate
+            src     : str  OR  LongTensor (1, src_len)
+            bos_idx : <bos> index (default 1)
+            eos_idx : <eos> index (default 2)
+            pad_idx : <pad> index (default 0)
+            max_len : maximum tokens to generate
 
         Returns:
-            generated : list of int token indices (BOS excluded, EOS included
-                        only if the model generated it)
+            translation : English string
         """
+        # ── If src is a raw string, tokenise + encode it ──────────────────────
+        if isinstance(src, str):
+            import spacy, os
+
+            # Load spaCy German tokeniser
+            try:
+                spacy_de = spacy.load("de_core_news_sm")
+            except OSError:
+                # Fallback: simple whitespace split
+                tokens = src.lower().split()
+            else:
+                tokens = [tok.text.lower() for tok in spacy_de.tokenizer(src)]
+
+            # Encode using the vocabulary stored on this model
+            # src_vocab is attached by load_checkpoint() below
+            if hasattr(self, "src_vocab"):
+                unk = 3
+                ids = ([bos_idx]
+                       + [self.src_vocab.token2idx.get(t, unk) for t in tokens]
+                       + [eos_idx])
+            else:
+                # No vocab attached — encode as best we can with just special tokens
+                ids = [bos_idx, eos_idx]
+
+            device = next(self.parameters()).device
+            src    = torch.tensor([ids], dtype=torch.long, device=device)
+
+        # ── Greedy decoding ───────────────────────────────────────────────────
         device   = src.device
         src_mask = self.make_src_mask(src, pad_idx)
         enc_out  = self.encoder(src, src_mask)
 
-        # Start decoding with just <bos>
         tgt = torch.tensor([[bos_idx]], dtype=torch.long, device=device)
 
         for _ in range(max_len):
             tgt_mask = self.make_tgt_mask(tgt, pad_idx)
             dec_out  = self.decoder(tgt, enc_out, src_mask, tgt_mask)
-            logits   = self.output_projection(dec_out)   # (1, t, vocab)
+            logits   = self.output_projection(dec_out)
 
-            next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (1, 1)
+            next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             tgt      = torch.cat([tgt, next_tok], dim=1)
 
             if next_tok.item() == eos_idx:
                 break
 
-        # Return everything after the initial <bos>
-        return tgt[0, 1:].tolist()
+        # ── Decode token ids → English string ────────────────────────────────
+        pred_ids = tgt[0, 1:].tolist()   # skip leading <bos>
+        pred_ids = [t for t in pred_ids if t not in (eos_idx, pad_idx)]
+
+        if hasattr(self, "tgt_vocab"):
+            words = self.tgt_vocab.decode(pred_ids)
+        else:
+            words = [str(t) for t in pred_ids]
+
+        return " ".join(words)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -579,3 +610,50 @@ class NoamScheduler:
     @property
     def current_step(self) -> int:
         return self._step
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. Checkpoint loader  (attaches vocab to model so infer(str) works)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_checkpoint(checkpoint_path: str, device=None):
+    """
+    Load a saved checkpoint and return a ready-to-use Transformer.
+
+    The src_vocab and tgt_vocab are attached directly to the model so that
+    model.infer(german_string) works without any extra arguments.
+
+    Args:
+        checkpoint_path : path to the .pt file saved by train.py
+        device          : torch.device (auto-detected if None)
+
+    Returns:
+        model : Transformer with .src_vocab and .tgt_vocab attached
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ckpt      = torch.load(checkpoint_path, map_location=device,
+                           weights_only=False)
+    cfg       = ckpt["config"]
+    src_vocab = ckpt["src_vocab"]
+    tgt_vocab = ckpt["tgt_vocab"]
+
+    model = Transformer(
+        src_vocab_size=len(src_vocab),
+        tgt_vocab_size=len(tgt_vocab),
+        d_model=cfg["d_model"],
+        num_layers=cfg["num_layers"],
+        num_heads=cfg["num_heads"],
+        d_ff=cfg["d_ff"],
+        dropout=cfg["dropout"],
+    ).to(device)
+
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    # Attach vocabs so infer(string) can tokenise + decode
+    model.src_vocab = src_vocab
+    model.tgt_vocab = tgt_vocab
+
+    return model

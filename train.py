@@ -318,6 +318,8 @@ def train(config: dict):
     print("\nEvaluating on test set …")
     ckpt = torch.load(config["save_path"], map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
+    model.src_vocab = src_vocab   # attach so infer(string) works
+    model.tgt_vocab = tgt_vocab
     test_bleu = compute_bleu(model, test_loader, tgt_vocab, device)
     print(f"Test BLEU: {test_bleu:.2f}")
     wandb.log({"test/bleu": test_bleu})
