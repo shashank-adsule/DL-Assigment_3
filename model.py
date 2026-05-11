@@ -391,13 +391,75 @@ class Transformer(nn.Module):
     Args:
         src_vocab_size : source vocabulary size
         tgt_vocab_size : target vocabulary size
-        d_model        : 256  (paper base: 512; scaled down for Multi30k)
-        num_layers     : 3    (paper base: 6)
+        d_model        : 512  (paper base)
+        num_layers     : 6    (paper base)
         num_heads      : 8
-        d_ff           : 512  (paper base: 2048)
+        d_ff           : 2048 (paper base)
         dropout        : 0.1
         max_len        : 5000
     """
+
+    # ── Google Drive file IDs ──────────────────────────────────────────────────
+    # After training, upload your .pt files to Google Drive (Anyone with link)
+    # and paste the file IDs here.  The autograder will download them
+    # automatically when Transformer() is instantiated.
+    #
+    # Share link format:
+    #   https://drive.google.com/file/d/  FILE_ID  /view?usp=sharing
+    #
+    # ↓↓ PASTE YOUR FILE IDs HERE AFTER TRAINING ↓↓
+    GDRIVE_CHECKPOINT_ID = "1tV0glBlcWqXBStgurv3oY4jhkhZyBqrG"
+    GDRIVE_VOCAB_ID       = "1C58fGtCeQ4Us9nLXrEBQrv8c-xIsFuGC"
+    # ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
+
+    CHECKPOINT_PATH = "checkpoints/best_model.pt"
+    VOCAB_PATH      = "checkpoints/vocab.pt"
+
+    @classmethod
+    def _download_if_missing(cls):
+        """
+        Download checkpoint and vocab from Google Drive if not present locally.
+        Called automatically in __init__ so the autograder never needs local files.
+        """
+        import os
+
+        files = [
+            (cls.GDRIVE_CHECKPOINT_ID, cls.CHECKPOINT_PATH),
+            (cls.GDRIVE_VOCAB_ID,      cls.VOCAB_PATH),
+        ]
+
+        for file_id, dest_path in files:
+            if file_id.startswith("YOUR_"):
+                continue   # not configured yet
+            if os.path.exists(dest_path):
+                continue   # already downloaded
+
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            print(f"Downloading {dest_path} from Google Drive …")
+
+            try:
+                import gdown
+                gdown.download(
+                    f"https://drive.google.com/uc?id={file_id}",
+                    dest_path, quiet=False
+                )
+            except ImportError:
+                import requests
+                url     = f"https://drive.google.com/uc?export=download&id={file_id}"
+                session = requests.Session()
+                resp    = session.get(url, stream=True)
+                # Handle large-file confirmation token
+                token   = None
+                for k, v in resp.cookies.items():
+                    if "download_warning" in k:
+                        token = v
+                if token:
+                    resp = session.get(url + f"&confirm={token}", stream=True)
+                with open(dest_path, "wb") as f:
+                    for chunk in resp.iter_content(32768):
+                        if chunk:
+                            f.write(chunk)
+            print(f"  ✓ Saved to {dest_path}")
 
     def __init__(self, src_vocab_size: int = 8000, tgt_vocab_size: int = 8000,
                  d_model: int = 512, num_layers: int = 6,
@@ -405,23 +467,47 @@ class Transformer(nn.Module):
                  dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
 
+        # ── Auto-download weights from Google Drive if missing ─────────────────
+        # This mirrors the pattern used in Assignment 2 where checkpoints are
+        # excluded from the repo and fetched on first instantiation.
+        self._download_if_missing()
+
         self.encoder = Encoder(src_vocab_size, d_model, num_layers,
                                num_heads, d_ff, dropout, max_len)
         self.decoder = Decoder(tgt_vocab_size, d_model, num_layers,
                                num_heads, d_ff, dropout, max_len)
 
         # Output projection: d_model → tgt_vocab_size
-        # No softmax here — loss functions operate on raw logits
         self.output_projection = nn.Linear(d_model, tgt_vocab_size, bias=False)
 
-        # ── Weight tying (paper section 3.4) ──────────────────────────────────
-        # Share the same weight matrix between:
-        #   (a) decoder token embedding
-        #   (b) output projection (pre-softmax linear)
-        # This reduces parameters and improves performance.
+        # Weight tying (paper section 3.4) — share embedding & output weights
         self.output_projection.weight = self.decoder.embedding.weight
 
         self._init_weights()
+
+        # ── Load weights + vocab from checkpoint ───────────────────────────────
+        # If checkpoint exists (downloaded above or already local), load it
+        # and attach vocab so infer(string) works without extra arguments.
+        import os
+        if os.path.exists(self.CHECKPOINT_PATH):
+            try:
+                ckpt = torch.load(self.CHECKPOINT_PATH,
+                                  map_location="cpu", weights_only=False)
+                # Load only keys that match (safe even if vocab sizes differ)
+                self.load_state_dict(ckpt["model_state"], strict=False)
+                print("  ✓ Weights loaded from checkpoint")
+            except Exception as e:
+                print(f"  Warning: could not load weights — {e}")
+
+        if os.path.exists(self.VOCAB_PATH):
+            try:
+                vocab_data     = torch.load(self.VOCAB_PATH,
+                                            map_location="cpu", weights_only=False)
+                self.src_vocab = vocab_data["src_vocab"]
+                self.tgt_vocab = vocab_data["tgt_vocab"]
+                print("  ✓ Vocab loaded from vocab.pt")
+            except Exception as e:
+                print(f"  Warning: could not load vocab — {e}")
 
     def _init_weights(self):
         """Xavier uniform initialisation (standard for Transformers)."""
@@ -515,7 +601,6 @@ class Transformer(nn.Module):
         # checkpoint file saved alongside the model.
         if not hasattr(self, "src_vocab") or self.src_vocab is None:
             import os, torch as _torch
-            # Try to find vocab file next to the checkpoint
             vocab_candidates = [
                 "checkpoints/vocab.pt",
                 "vocab.pt",
@@ -528,6 +613,18 @@ class Transformer(nn.Module):
                     self.src_vocab = vocab_data["src_vocab"]
                     self.tgt_vocab = vocab_data["tgt_vocab"]
                     break
+            else:
+                # Try downloading vocab.pt from Google Drive as last resort
+                try:
+                    from train import ensure_checkpoints
+                    ensure_checkpoints()
+                    if os.path.exists("checkpoints/vocab.pt"):
+                        vocab_data = _torch.load("checkpoints/vocab.pt",
+                                                 weights_only=False)
+                        self.src_vocab = vocab_data["src_vocab"]
+                        self.tgt_vocab = vocab_data["tgt_vocab"]
+                except Exception:
+                    pass
 
         # ── If src is a raw string, tokenise + encode ─────────────────────────
         if isinstance(src, str):
