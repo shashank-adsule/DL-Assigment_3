@@ -30,32 +30,142 @@ from lr_scheduler import get_optimizer_and_scheduler
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Google Drive checkpoint downloader
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Fill in your actual Google Drive file IDs here ───────────────────────────
+GDRIVE_FILE_IDS = {
+    "checkpoints/best_model.pt" : "YOUR_BEST_MODEL_FILE_ID_HERE",
+    "checkpoints/vocab.pt"      : "YOUR_VOCAB_FILE_ID_HERE",
+}
+
+def download_from_gdrive(file_id: str, dest_path: str):
+    """
+    Download a file from Google Drive using gdown.
+    Falls back to requests if gdown is unavailable.
+
+    Args:
+        file_id   : Google Drive file ID (from the share link)
+        dest_path : local path to save the file
+    """
+    if os.path.exists(dest_path):
+        print(f"  Already exists: {dest_path}")
+        return
+
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    print(f"  Downloading {dest_path} from Google Drive …")
+
+    try:
+        import gdown
+        url = f"https://drive.google.com/uc?id={file_id}"
+        gdown.download(url, dest_path, quiet=False)
+
+    except ImportError:
+        # Fallback using requests (no gdown needed)
+        import requests
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        session  = requests.Session()
+        response = session.get(url, stream=True)
+
+        # Handle Google's virus-scan warning for large files
+        for key, value in response.cookies.items():
+            if "download_warning" in key:
+                response = session.get(
+                    url + f"&confirm={value}", stream=True
+                )
+                break
+
+        with open(dest_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=32768):
+                if chunk:
+                    f.write(chunk)
+
+    print(f"  ✓ Saved to {dest_path}")
+
+
+def ensure_checkpoints():
+    """
+    Download best_model.pt and vocab.pt from Google Drive if not present locally.
+    Call this at the start of translate() or any inference function.
+    """
+    for dest_path, file_id in GDRIVE_FILE_IDS.items():
+        if file_id == "YOUR_BEST_MODEL_FILE_ID_HERE":
+            continue   # not configured yet
+        download_from_gdrive(file_id, dest_path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Default hyperparameters
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_CONFIG = dict(
     # Model — paper base model (Table 3, section 3)
-    d_model      = 512,    # paper: 512
-    num_layers   = 6,      # paper: N=6
-    num_heads    = 8,      # paper: h=8  → d_k = d_v = 512/8 = 64
-    d_ff         = 2048,   # paper: d_ff = 2048
-    dropout      = 0.1,    # paper: P_drop = 0.1
+    d_model      = 512,
+    num_layers   = 6,
+    num_heads    = 8,
+    d_ff         = 2048,
+    dropout      = 0.1,
     max_len      = 200,
 
-    # Training — paper section 5
-    batch_size   = 64,     # safe for 6GB VRAM with d_model=512
-    num_epochs   = 30,     # Multi30k is small so 30 epochs ≈ 100K steps
-    warmup_steps = 4000,   # paper: warmup_steps = 4000
-    label_smooth = 0.1,    # paper: ε_ls = 0.1
+    # Training
+    batch_size   = 64,
+    num_epochs   = 35,       # more epochs = better BLEU on small dataset
+    warmup_steps = 4000,
+    label_smooth = 0.1,
     clip_grad    = 1.0,
     min_freq     = 2,
     seed         = 42,
+
+    # Checkpoint averaging (paper section 6.1)
+    # Save last N checkpoints and average their weights for final model
+    avg_checkpoints = 5,
 
     # I/O
     save_path     = "checkpoints/best_model.pt",
     wandb_project = "da6401_assignment3",
     wandb_entity  = None,
 )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Checkpoint Averaging  (paper section 6.1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def average_checkpoints(checkpoint_paths: list, save_path: str):
+    """
+    Average weights of multiple checkpoints.
+    Paper: "We used a single model obtained by averaging the last 5 checkpoints"
+    This consistently adds +1 to +2 BLEU over the single best checkpoint.
+
+    Args:
+        checkpoint_paths : list of .pt file paths to average
+        save_path        : where to save the averaged checkpoint
+    """
+    print(f"\nAveraging {len(checkpoint_paths)} checkpoints …")
+    avg_state = None
+    ref_ckpt  = None
+
+    for path in checkpoint_paths:
+        ckpt  = torch.load(path, map_location="cpu", weights_only=False)
+        state = ckpt["model_state"]
+        if avg_state is None:
+            avg_state = {k: v.float().clone() for k, v in state.items()}
+            ref_ckpt  = ckpt
+        else:
+            for k in avg_state:
+                avg_state[k] += state[k].float()
+
+    # Divide by number of checkpoints
+    n = len(checkpoint_paths)
+    for k in avg_state:
+        avg_state[k] = (avg_state[k] / n).to(
+            ref_ckpt["model_state"][k].dtype
+        )
+
+    # Save averaged checkpoint (reuse metadata from most recent)
+    ref_ckpt["model_state"] = avg_state
+    torch.save(ref_ckpt, save_path)
+    print(f"  ✓ Averaged checkpoint saved to {save_path}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -271,7 +381,9 @@ def train(config: dict):
     )
 
     os.makedirs(os.path.dirname(config["save_path"]), exist_ok=True)
+    ckpt_dir      = os.path.dirname(config["save_path"])
     best_val_loss = float("inf")
+    recent_ckpts  = []   # track last N epoch checkpoints for averaging
 
     for epoch in range(1, config["num_epochs"] + 1):
         train_loss = train_epoch(model, train_loader, optimizer, scheduler,
@@ -303,6 +415,7 @@ def train(config: dict):
 
         wandb.log(log)
 
+        # ── Save best single checkpoint ───────────────────────────────────────
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save({
@@ -312,21 +425,63 @@ def train(config: dict):
                 "tgt_vocab"  : tgt_vocab,
                 "config"     : config,
             }, config["save_path"])
-
-            # Save vocab separately so model.infer(string) works when the
-            # autograder loads only the weights via load_state_dict()
-            vocab_path = os.path.join(
-                os.path.dirname(config["save_path"]), "vocab.pt"
-            )
+            vocab_path = os.path.join(ckpt_dir, "vocab.pt")
             torch.save({"src_vocab": src_vocab, "tgt_vocab": tgt_vocab},
                        vocab_path)
-            print(f"          ✓ checkpoint saved (val_loss={val_loss:.4f})")
+            print(f"          ✓ best checkpoint saved (val_loss={val_loss:.4f})")
 
-    # Final test-set BLEU from best checkpoint
+        # ── Save per-epoch checkpoint for averaging (last N epochs) ───────────
+        # Paper section 6.1: average last 5 checkpoints for +1~2 BLEU
+        epoch_path = os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt")
+        torch.save({
+            "epoch"      : epoch,
+            "model_state": model.state_dict(),
+            "src_vocab"  : src_vocab,
+            "tgt_vocab"  : tgt_vocab,
+            "config"     : config,
+        }, epoch_path)
+        recent_ckpts.append(epoch_path)
+
+        # Keep only the last avg_checkpoints files on disk
+        n_avg = config.get("avg_checkpoints", 5)
+        if len(recent_ckpts) > n_avg:
+            old = recent_ckpts.pop(0)
+            if os.path.exists(old):
+                os.remove(old)
+
+    # ── Checkpoint averaging (paper section 6.1) ──────────────────────────────
+    if len(recent_ckpts) > 1:
+        avg_path = os.path.join(ckpt_dir, "averaged_model.pt")
+        average_checkpoints(recent_ckpts, avg_path)
+
+        # Evaluate averaged model — use it if better than best single ckpt
+        avg_ckpt = torch.load(avg_path, map_location=device, weights_only=False)
+        model.load_state_dict(avg_ckpt["model_state"])
+        avg_bleu = compute_bleu(model, val_loader, tgt_vocab, device)
+        print(f"  Averaged model val_bleu = {avg_bleu:.2f}")
+
+        # Load best single model for comparison
+        best_ckpt = torch.load(config["save_path"], map_location=device,
+                               weights_only=False)
+        model.load_state_dict(best_ckpt["model_state"])
+        best_bleu = compute_bleu(model, val_loader, tgt_vocab, device)
+        print(f"  Best single  val_bleu = {best_bleu:.2f}")
+
+        # Use whichever is better as the final submission checkpoint
+        if avg_bleu > best_bleu:
+            print("  → Using averaged checkpoint as final model")
+            import shutil
+            shutil.copy(avg_path, config["save_path"])
+            # Reload the better model
+            model.load_state_dict(avg_ckpt["model_state"])
+        else:
+            print("  → Keeping best single checkpoint as final model")
+
+        wandb.log({"val/bleu_averaged": avg_bleu, "val/bleu_best_single": best_bleu})
+
+    # ── Final test-set BLEU ───────────────────────────────────────────────────
     print("\nEvaluating on test set …")
-    ckpt = torch.load(config["save_path"], map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state"])
-    model.src_vocab = src_vocab   # attach so infer(string) works
+    model.src_vocab = src_vocab
     model.tgt_vocab = tgt_vocab
     test_bleu = compute_bleu(model, test_loader, tgt_vocab, device)
     print(f"Test BLEU: {test_bleu:.2f}")
@@ -341,6 +496,9 @@ def train(config: dict):
 def translate(checkpoint_path: str, sentence: str, max_len: int = 100):
     """Load a checkpoint and translate one German sentence to English."""
     from dataset import load_spacy_models, tokenize_de
+
+    # Download from Google Drive if not present locally
+    ensure_checkpoints()
 
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt      = torch.load(checkpoint_path, map_location=device, weights_only=False)

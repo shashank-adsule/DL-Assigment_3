@@ -408,7 +408,8 @@ class Transformer(nn.Module):
     #   https://drive.google.com/file/d/  FILE_ID  /view?usp=sharing
     #
     # ↓↓ PASTE YOUR FILE IDs HERE AFTER TRAINING ↓↓
-    GDRIVE_CHECKPOINT_ID = "1tV0glBlcWqXBStgurv3oY4jhkhZyBqrG"
+    GDRIVE_CHECKPOINT_ID = "1CU69Z2RnF_PNEUlb6iit7Rvfxf7ooz-C"        # average model 
+    # GDRIVE_CHECKPOINT_ID = "1tV0glBlcWqXBStgurv3oY4jhkhZyBqrG"
     GDRIVE_VOCAB_ID       = "1C58fGtCeQ4Us9nLXrEBQrv8c-xIsFuGC"
     # ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
