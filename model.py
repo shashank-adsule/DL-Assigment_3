@@ -399,19 +399,33 @@ class Transformer(nn.Module):
         max_len        : 5000
     """
 
-    # ── Google Drive file IDs ──────────────────────────────────────────────────
-    # After training, upload your .pt files to Google Drive (Anyone with link)
-    # and paste the file IDs here.  The autograder will download them
-    # automatically when Transformer() is instantiated.
+    # ── Google Drive file IDs (loaded from .env automatically) ───────────────
+    # Edit the .env file in the project root — no need to touch model.py.
     #
-    # Share link format:
-    #   https://drive.google.com/file/d/  FILE_ID  /view?usp=sharing
+    # .env format:
+    #   GDRIVE_CHECKPOINT_ID=your_file_id_here
+    #   GDRIVE_VOCAB_ID=your_vocab_id_here
     #
-    # ↓↓ PASTE YOUR FILE IDs HERE AFTER TRAINING ↓↓
-    GDRIVE_CHECKPOINT_ID = "1CU69Z2RnF_PNEUlb6iit7Rvfxf7ooz-C"        # average model 
-    # GDRIVE_CHECKPOINT_ID = "1tV0glBlcWqXBStgurv3oY4jhkhZyBqrG"
-    GDRIVE_VOCAB_ID       = "1C58fGtCeQ4Us9nLXrEBQrv8c-xIsFuGC"
-    # ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
+    @staticmethod
+    def _load_env():
+        """Read .env file and return dict of key→value pairs."""
+        import os
+        env = {}
+        # Search for .env in current dir and script's dir
+        candidates = [
+            ".env",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                with open(path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            env[k.strip()] = v.strip()
+                break
+        return env
 
     CHECKPOINT_PATH = "checkpoints/best_model.pt"
     VOCAB_PATH      = "checkpoints/vocab.pt"
@@ -420,17 +434,21 @@ class Transformer(nn.Module):
     def _download_if_missing(cls):
         """
         Download checkpoint and vocab from Google Drive if not present locally.
-        Called automatically in __init__ so the autograder never needs local files.
+        File IDs are read from the .env file — no hardcoding needed.
         """
         import os
 
+        env = cls._load_env()
+        checkpoint_id = env.get("GDRIVE_CHECKPOINT_ID", "")
+        vocab_id      = env.get("GDRIVE_VOCAB_ID", "")
+
         files = [
-            (cls.GDRIVE_CHECKPOINT_ID, cls.CHECKPOINT_PATH),
-            (cls.GDRIVE_VOCAB_ID,      cls.VOCAB_PATH),
+            (checkpoint_id, cls.CHECKPOINT_PATH),
+            (vocab_id,      cls.VOCAB_PATH),
         ]
 
         for file_id, dest_path in files:
-            if file_id.startswith("YOUR_"):
+            if not file_id or file_id.startswith("YOUR_"):
                 continue   # not configured yet
             if os.path.exists(dest_path):
                 continue   # already downloaded
@@ -449,7 +467,6 @@ class Transformer(nn.Module):
                 url     = f"https://drive.google.com/uc?export=download&id={file_id}"
                 session = requests.Session()
                 resp    = session.get(url, stream=True)
-                # Handle large-file confirmation token
                 token   = None
                 for k, v in resp.cookies.items():
                     if "download_warning" in k:
