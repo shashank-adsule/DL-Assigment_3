@@ -109,8 +109,8 @@ DEFAULT_CONFIG = dict(
 
     # Training
     batch_size   = 64,
-    num_epochs   = 35,       # more epochs = better BLEU on small dataset
-    warmup_steps = 4000,
+    num_epochs   = [5,50][0],       # more epochs = better BLEU on small dataset
+    warmup_steps = 2000,     # Multi30k: ~450 steps/epoch; 4000 peaks at epoch 9 (too late)
     label_smooth = 0.1,
     clip_grad    = 1.0,
     min_freq     = 2,
@@ -208,10 +208,16 @@ class LabelSmoothingLoss(nn.Module):
         log_probs = F.log_softmax(logits, dim=-1)
 
         with torch.no_grad():
-            smooth_dist = torch.full_like(log_probs,
-                                          self.smoothing / (self.vocab_size - 2))
-            smooth_dist[:, self.pad_idx] = 0.0
+            # Distribute smoothing mass over all tokens except <pad> and correct
+            # vocab_size - 2: exclude <pad> (idx 0) and the correct token
+            smooth_val  = self.smoothing / max(self.vocab_size - 2, 1)
+            smooth_dist = torch.full_like(log_probs, smooth_val)
+            smooth_dist[:, self.pad_idx] = 0.0   # never assign mass to <pad>
+            # Correct token gets (1 - smoothing); this overwrites the smooth_val
+            # that was placed there, which is correct because the denominator
+            # already excluded it
             smooth_dist.scatter_(1, targets.unsqueeze(1), self.confidence)
+            # Zero out entire rows that ARE padding (don't count pad positions)
             non_pad = (targets != self.pad_idx)
             smooth_dist[~non_pad] = 0.0
 
@@ -224,20 +230,20 @@ class LabelSmoothingLoss(nn.Module):
 # BLEU evaluation
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_bleu(model, data_loader, tgt_vocab, device, max_len: int = 100):
+def compute_bleu(model, data_loader, tgt_vocab, device,
+                 max_len: int = 100, beam_size: int = 4):
     """
-    Corpus-level BLEU score via greedy decoding.
-    Uses the `evaluate` library (sacrebleu backend) when available.
+    Corpus-level BLEU score via beam-search decoding.
+    Uses sacrebleu when available (matches WMT evaluation standard).
 
     Returns:
         bleu_score : float in [0, 100]
     """
     try:
-        import evaluate as hf_evaluate
-        bleu_metric = hf_evaluate.load("bleu")
-        use_hf = True
-    except Exception:
-        use_hf = False
+        import sacrebleu as sb
+        use_sacre = True
+    except ImportError:
+        use_sacre = False
 
     model.eval()
     predictions, references = [], []
@@ -248,35 +254,61 @@ def compute_bleu(model, data_loader, tgt_vocab, device, max_len: int = 100):
             tgt_batch = tgt_batch.to(device)
 
             for i in range(src_batch.size(0)):
-                src      = src_batch[i].unsqueeze(0)
-                pred_ids = model.infer(src, BOS_IDX, EOS_IDX, PAD_IDX, max_len)
-                pred_ids = [t for t in pred_ids
-                            if t not in (BOS_IDX, EOS_IDX, PAD_IDX)]
+                src = src_batch[i].unsqueeze(0)
 
-                ref_ids  = tgt_batch[i].tolist()
-                ref_ids  = [t for t in ref_ids
-                            if t not in (BOS_IDX, EOS_IDX, PAD_IDX)]
+                # return_tokens=True keeps ids so we can decode once
+                pred_ids = model.infer(src, BOS_IDX, EOS_IDX, PAD_IDX,
+                                       max_len=max_len, beam_size=beam_size,
+                                       return_tokens=True)
 
-                predictions.append(" ".join(tgt_vocab.decode(pred_ids)))
-                references.append([" ".join(tgt_vocab.decode(ref_ids))])
+                ref_ids = tgt_batch[i].tolist()
+                ref_ids = [t for t in ref_ids
+                           if t not in (BOS_IDX, EOS_IDX, PAD_IDX)]
 
-    if use_hf:
-        result = bleu_metric.compute(predictions=predictions,
-                                     references=references)
-        return result["bleu"] * 100
+                pred_str = " ".join(tgt_vocab.decode(pred_ids)) if pred_ids else ""
+                ref_str  = " ".join(tgt_vocab.decode(ref_ids))  if ref_ids  else ""
 
-    # Fallback: simple 4-gram precision
+                predictions.append(pred_str)
+                references.append(ref_str)
+
+    if use_sacre:
+        bleu = sb.corpus_bleu(predictions, [references])
+        return bleu.score
+
+    # Fallback: 4-gram BLEU with brevity penalty
     from collections import Counter
+    import math
+
     def ngrams(toks, n):
         return Counter(tuple(toks[i:i+n]) for i in range(len(toks) - n + 1))
-    total_match, total_pred = 0, 0
-    for pred, refs in zip(predictions, references):
-        p_tok = pred.split(); r_tok = refs[0].split()
-        p4 = ngrams(p_tok, 4); r4 = ngrams(r_tok, 4)
-        for ng, cnt in p4.items():
-            total_match += min(cnt, r4.get(ng, 0))
-        total_pred += max(len(p_tok) - 3, 0)
-    return (total_match / max(total_pred, 1)) * 100
+
+    clip_matches   = [0] * 4
+    total_pred_n   = [0] * 4
+    total_pred_len = 0
+    total_ref_len  = 0
+
+    for pred, ref in zip(predictions, references):
+        p_toks = pred.split()
+        r_toks = ref.split()
+        total_pred_len += len(p_toks)
+        total_ref_len  += len(r_toks)
+        for n in range(1, 5):
+            p_ng = ngrams(p_toks, n)
+            r_ng = ngrams(r_toks, n)
+            for ng, cnt in p_ng.items():
+                clip_matches[n-1] += min(cnt, r_ng.get(ng, 0))
+            total_pred_n[n-1] += max(len(p_toks) - n + 1, 0)
+
+    precisions = []
+    for m, t in zip(clip_matches, total_pred_n):
+        precisions.append(m / t if t > 0 else 0.0)
+
+    if any(p == 0 for p in precisions):
+        return 0.0
+
+    log_avg = sum(math.log(p) for p in precisions) / 4
+    bp = min(1.0, math.exp(1 - total_ref_len / max(total_pred_len, 1)))
+    return bp * math.exp(log_avg) * 100
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -306,8 +338,8 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device,
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
 
-        scheduler.step()    # Noam: update LR before optimizer.step()
         optimizer.step()
+        scheduler.step()    # Noam: update LR after optimizer.step()
 
         total_loss += loss.item()
         n_batches  += 1
@@ -359,7 +391,7 @@ def train(config: dict):
         max_len=config["max_len"],
     )
 
-    # Model
+    # Model — fresh init, no checkpoint auto-load during training
     model = Transformer(
         src_vocab_size=len(src_vocab),
         tgt_vocab_size=len(tgt_vocab),
@@ -369,6 +401,7 @@ def train(config: dict):
         d_ff=config["d_ff"],
         dropout=config["dropout"],
         max_len=config["max_len"],
+        _from_train=True,          # skip auto-download and auto-load
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -383,6 +416,7 @@ def train(config: dict):
     os.makedirs(os.path.dirname(config["save_path"]), exist_ok=True)
     ckpt_dir      = os.path.dirname(config["save_path"])
     best_val_loss = float("inf")
+    best_val_bleu = 0.0
     recent_ckpts  = []   # track last N epoch checkpoints for averaging
 
     for epoch in range(1, config["num_epochs"] + 1):
@@ -392,9 +426,18 @@ def train(config: dict):
         train_ppl  = math.exp(min(train_loss, 100))
         val_ppl    = math.exp(min(val_loss,   100))
 
+        # Attach vocab so infer(tensor) can decode — must be set before compute_bleu
+        model.src_vocab = src_vocab
+        model.tgt_vocab = tgt_vocab
+
+        # Compute BLEU every epoch (greedy for speed; beam search only at end)
+        val_bleu = compute_bleu(model, val_loader, tgt_vocab, device,
+                                max_len=80, beam_size=1)
+
         print(f"Epoch {epoch:02d} | "
               f"train_loss={train_loss:.4f} ppl={train_ppl:.1f} | "
               f"val_loss={val_loss:.4f} ppl={val_ppl:.1f} | "
+              f"val_bleu={val_bleu:.2f} | "
               f"lr={scheduler.current_lr:.6f}")
 
         log = {
@@ -403,21 +446,16 @@ def train(config: dict):
             "train/perplexity": train_ppl,
             "val/loss"        : val_loss,
             "val/perplexity"  : val_ppl,
+            "val/bleu"        : val_bleu,
             "lr"              : scheduler.current_lr,
             "step"            : scheduler.current_step,
         }
 
-        # BLEU every 5 epochs (greedy decoding over full val set is slow)
-        if epoch % 5 == 0 or epoch == config["num_epochs"]:
-            val_bleu = compute_bleu(model, val_loader, tgt_vocab, device)
-            log["val/bleu"] = val_bleu
-            print(f"          val_bleu={val_bleu:.2f}")
-
         wandb.log(log)
 
-        # ── Save best single checkpoint ───────────────────────────────────────
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # ── Save best checkpoint by BLEU (not val loss) ───────────────────────
+        if val_bleu > best_val_bleu:
+            best_val_bleu = val_bleu
             torch.save({
                 "epoch"      : epoch,
                 "model_state": model.state_dict(),
@@ -428,7 +466,7 @@ def train(config: dict):
             vocab_path = os.path.join(ckpt_dir, "vocab.pt")
             torch.save({"src_vocab": src_vocab, "tgt_vocab": tgt_vocab},
                        vocab_path)
-            print(f"          ✓ best checkpoint saved (val_loss={val_loss:.4f})")
+            print(f"          ✓ best checkpoint saved (val_bleu={val_bleu:.2f})")
 
         # ── Save per-epoch checkpoint for averaging (last N epochs) ───────────
         # Paper section 6.1: average last 5 checkpoints for +1~2 BLEU
@@ -457,14 +495,16 @@ def train(config: dict):
         # Evaluate averaged model — use it if better than best single ckpt
         avg_ckpt = torch.load(avg_path, map_location=device, weights_only=False)
         model.load_state_dict(avg_ckpt["model_state"])
-        avg_bleu = compute_bleu(model, val_loader, tgt_vocab, device)
+        avg_bleu = compute_bleu(model, val_loader, tgt_vocab, device,
+                                beam_size=4)
         print(f"  Averaged model val_bleu = {avg_bleu:.2f}")
 
         # Load best single model for comparison
         best_ckpt = torch.load(config["save_path"], map_location=device,
                                weights_only=False)
         model.load_state_dict(best_ckpt["model_state"])
-        best_bleu = compute_bleu(model, val_loader, tgt_vocab, device)
+        best_bleu = compute_bleu(model, val_loader, tgt_vocab, device,
+                                 beam_size=4)
         print(f"  Best single  val_bleu = {best_bleu:.2f}")
 
         # Use whichever is better as the final submission checkpoint
@@ -483,7 +523,7 @@ def train(config: dict):
     print("\nEvaluating on test set …")
     model.src_vocab = src_vocab
     model.tgt_vocab = tgt_vocab
-    test_bleu = compute_bleu(model, test_loader, tgt_vocab, device)
+    test_bleu = compute_bleu(model, test_loader, tgt_vocab, device, beam_size=4)
     print(f"Test BLEU: {test_bleu:.2f}")
     wandb.log({"test/bleu": test_bleu})
     wandb.finish()
@@ -495,38 +535,16 @@ def train(config: dict):
 
 def translate(checkpoint_path: str, sentence: str, max_len: int = 100):
     """Load a checkpoint and translate one German sentence to English."""
-    from dataset import load_spacy_models, tokenize_de
+    from model import load_checkpoint
 
     # Download from Google Drive if not present locally
     ensure_checkpoints()
 
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt      = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg       = ckpt["config"]
-    src_vocab = ckpt["src_vocab"]
-    tgt_vocab = ckpt["tgt_vocab"]
-
-    model = Transformer(
-        src_vocab_size=len(src_vocab),
-        tgt_vocab_size=len(tgt_vocab),
-        d_model=cfg["d_model"],
-        num_layers=cfg["num_layers"],
-        num_heads=cfg["num_heads"],
-        d_ff=cfg["d_ff"],
-        dropout=cfg["dropout"],
-    ).to(device)
-    model.load_state_dict(ckpt["model_state"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model  = load_checkpoint(checkpoint_path, device=device)
     model.eval()
 
-    spacy_de, _ = load_spacy_models()
-    tokens      = tokenize_de(sentence, spacy_de)
-    ids         = [BOS_IDX] + src_vocab.encode(tokens) + [EOS_IDX]
-    src         = torch.tensor([ids], dtype=torch.long, device=device)
-
-    pred_ids    = model.infer(src, BOS_IDX, EOS_IDX, PAD_IDX, max_len)
-    pred_ids    = [t for t in pred_ids if t not in (EOS_IDX, PAD_IDX)]
-    translation = " ".join(tgt_vocab.decode(pred_ids))
-
+    translation = model.infer(sentence, beam_size=4, max_len=max_len)
     print(f"DE: {sentence}")
     print(f"EN: {translation}")
     return translation

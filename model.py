@@ -411,13 +411,17 @@ class Transformer(nn.Module):
         """Read .env file and return dict of key→value pairs."""
         import os
         env = {}
-        # Search for .env in current dir and script's dir
+        # Search in multiple locations — autograder may run from different dirs
+        script_dir = os.path.dirname(os.path.abspath(__file__))
         candidates = [
             ".env",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+            os.path.join(script_dir, ".env"),
+            os.path.join(os.path.dirname(script_dir), ".env"),
+            "/autograder/source/.env",
         ]
         for path in candidates:
             if os.path.exists(path):
+                print(f"  [env] Loading from: {path}")
                 with open(path) as f:
                     for line in f:
                         line = line.strip()
@@ -425,6 +429,9 @@ class Transformer(nn.Module):
                             k, v = line.split("=", 1)
                             env[k.strip()] = v.strip()
                 break
+        else:
+            print("  [env] WARNING: .env file not found in any search path!")
+            print(f"  [env] Searched: {candidates}")
         return env
 
     CHECKPOINT_PATH = "checkpoints/best_model.pt"
@@ -439,8 +446,16 @@ class Transformer(nn.Module):
         import os
 
         env = cls._load_env()
-        checkpoint_id = env.get("GDRIVE_CHECKPOINT_ID", "")
-        vocab_id      = env.get("GDRIVE_VOCAB_ID", "")
+        checkpoint_id = env.get("GDRIVE_CHECKPOINT_ID", "").strip()
+        vocab_id      = env.get("GDRIVE_VOCAB_ID", "").strip()
+
+        # Debug: show what was found in .env
+        print(f"  [env] GDRIVE_CHECKPOINT_ID = '{checkpoint_id[:8]}...'" 
+              if len(checkpoint_id) > 8 else
+              f"  [env] GDRIVE_CHECKPOINT_ID = '{checkpoint_id}' (NOT SET)")
+        print(f"  [env] GDRIVE_VOCAB_ID      = '{vocab_id[:8]}...'"
+              if len(vocab_id) > 8 else
+              f"  [env] GDRIVE_VOCAB_ID      = '{vocab_id}' (NOT SET)")
 
         files = [
             (checkpoint_id, cls.CHECKPOINT_PATH),
@@ -449,9 +464,11 @@ class Transformer(nn.Module):
 
         for file_id, dest_path in files:
             if not file_id or file_id.startswith("YOUR_"):
-                continue   # not configured yet
+                print(f"  Skipping {dest_path} — file ID not configured in .env")
+                continue
             if os.path.exists(dest_path):
-                continue   # already downloaded
+                print(f"  Already exists: {dest_path}")
+                continue
 
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             print(f"Downloading {dest_path} from Google Drive …")
@@ -477,35 +494,48 @@ class Transformer(nn.Module):
                     for chunk in resp.iter_content(32768):
                         if chunk:
                             f.write(chunk)
-            print(f"  ✓ Saved to {dest_path}")
+
+            if os.path.exists(dest_path):
+                print(f"  ✓ Saved to {dest_path}")
+            else:
+                print(f"  ✗ Download FAILED for {dest_path}")
 
     def __init__(self, src_vocab_size: int = 8000, tgt_vocab_size: int = 8000,
                  d_model: int = 512, num_layers: int = 6,
                  num_heads: int = 8, d_ff: int = 2048,
-                 dropout: float = 0.1, max_len: int = 5000):
-        # ── Download checkpoints from Google Drive if missing ──────────────────
-        self._download_if_missing()
-
-        # ── Override vocab sizes from checkpoint so no size mismatch ──────────
-        # The autograder calls Transformer() with no args (default 8000/8000)
-        # but the real vocab sizes are stored in the checkpoint.
+                 dropout: float = 0.1, max_len: int = 5000,
+                 _from_train: bool = False):
+        """
+        Args:
+            _from_train : set True when called from train.py so that
+                          auto-download and auto-load are skipped entirely.
+                          The autograder calls Transformer() with no args
+                          (default False) so it still gets auto-load behaviour.
+        """
         import os, torch as _torch
-        if os.path.exists(self.CHECKPOINT_PATH):
-            try:
-                _ckpt = _torch.load(self.CHECKPOINT_PATH,
-                                    map_location="cpu", weights_only=False)
-                _cfg  = _ckpt.get("config", {})
-                src_vocab_size = len(_ckpt["src_vocab"])
-                tgt_vocab_size = len(_ckpt["tgt_vocab"])
-                # Also override architecture from saved config
-                d_model    = _cfg.get("d_model",    d_model)
-                num_layers = _cfg.get("num_layers", num_layers)
-                num_heads  = _cfg.get("num_heads",  num_heads)
-                d_ff       = _cfg.get("d_ff",       d_ff)
-                dropout    = _cfg.get("dropout",    dropout)
-                max_len    = _cfg.get("max_len",    max_len)
-            except Exception as e:
-                print(f"  Warning: could not read checkpoint config — {e}")
+
+        if not _from_train:
+            # ── Autograder / inference path ────────────────────────────────────
+            # Download checkpoints from Google Drive if missing, then
+            # override vocab sizes + architecture from the saved checkpoint
+            # so that load_state_dict(strict=True) never mismatches.
+            self._download_if_missing()
+
+            if os.path.exists(self.CHECKPOINT_PATH):
+                try:
+                    _ckpt = _torch.load(self.CHECKPOINT_PATH,
+                                        map_location="cpu", weights_only=False)
+                    _cfg  = _ckpt.get("config", {})
+                    src_vocab_size = len(_ckpt["src_vocab"])
+                    tgt_vocab_size = len(_ckpt["tgt_vocab"])
+                    d_model    = _cfg.get("d_model",    d_model)
+                    num_layers = _cfg.get("num_layers", num_layers)
+                    num_heads  = _cfg.get("num_heads",  num_heads)
+                    d_ff       = _cfg.get("d_ff",       d_ff)
+                    dropout    = _cfg.get("dropout",    dropout)
+                    max_len    = _cfg.get("max_len",    max_len)
+                except Exception as e:
+                    print(f"  Warning: could not read checkpoint config — {e}")
 
         super().__init__()
 
@@ -519,28 +549,29 @@ class Transformer(nn.Module):
 
         self._init_weights()
 
-        # ── Load weights ───────────────────────────────────────────────────────
-        if os.path.exists(self.CHECKPOINT_PATH):
-            try:
-                ckpt = _torch.load(self.CHECKPOINT_PATH,
-                                   map_location="cpu", weights_only=False)
-                self.load_state_dict(ckpt["model_state"], strict=True)
-                self.src_vocab = ckpt["src_vocab"]
-                self.tgt_vocab = ckpt["tgt_vocab"]
-                print("  ✓ Weights and vocab loaded from checkpoint")
-            except Exception as e:
-                print(f"  Warning: could not load weights — {e}")
+        if not _from_train:
+            # ── Load weights (autograder / inference path only) ────────────────
+            if os.path.exists(self.CHECKPOINT_PATH):
+                try:
+                    ckpt = _torch.load(self.CHECKPOINT_PATH,
+                                       map_location="cpu", weights_only=False)
+                    self.load_state_dict(ckpt["model_state"], strict=True)
+                    self.src_vocab = ckpt["src_vocab"]
+                    self.tgt_vocab = ckpt["tgt_vocab"]
+                    print("  ✓ Weights and vocab loaded from checkpoint")
+                except Exception as e:
+                    print(f"  Warning: could not load weights — {e}")
 
-        # ── Load vocab (fallback from vocab.pt) ───────────────────────────────
-        if not hasattr(self, "src_vocab") and os.path.exists(self.VOCAB_PATH):
-            try:
-                v = _torch.load(self.VOCAB_PATH,
-                                map_location="cpu", weights_only=False)
-                self.src_vocab = v["src_vocab"]
-                self.tgt_vocab = v["tgt_vocab"]
-                print("  ✓ Vocab loaded from vocab.pt")
-            except Exception as e:
-                print(f"  Warning: could not load vocab — {e}")
+            # ── Load vocab fallback ────────────────────────────────────────────
+            if not hasattr(self, "src_vocab") and os.path.exists(self.VOCAB_PATH):
+                try:
+                    v = _torch.load(self.VOCAB_PATH,
+                                    map_location="cpu", weights_only=False)
+                    self.src_vocab = v["src_vocab"]
+                    self.tgt_vocab = v["tgt_vocab"]
+                    print("  ✓ Vocab loaded from vocab.pt")
+                except Exception as e:
+                    print(f"  Warning: could not load vocab — {e}")
 
     def _init_weights(self):
         """Xavier uniform initialisation (standard for Transformers)."""
@@ -611,27 +642,32 @@ class Transformer(nn.Module):
 
     @torch.no_grad()
     def infer(self, src, bos_idx: int = 1, eos_idx: int = 2,
-              pad_idx: int = 0, max_len: int = 50):
+              pad_idx: int = 0, max_len: int = 50,
+              beam_size: int = 4, return_tokens: bool = False):
         """
-        Greedy decoding. Accepts either:
+        Beam-search decoding (falls back to greedy when beam_size=1).
+
+        Accepts either:
           - a raw German string  → tokenises, decodes, returns English string
-          - a LongTensor (1, src_len) → returns English string
+          - a LongTensor (1, src_len) → returns English string (or token ids
+            when return_tokens=True, for use inside compute_bleu)
 
         The autograder calls:  model.infer(german_string)
 
         Args:
-            src     : str  OR  LongTensor (1, src_len)
-            bos_idx : <bos> index (default 1)
-            eos_idx : <eos> index (default 2)
-            pad_idx : <pad> index (default 0)
-            max_len : maximum tokens to generate
+            src           : str  OR  LongTensor (1, src_len)
+            bos_idx       : <bos> index (default 1)
+            eos_idx       : <eos> index (default 2)
+            pad_idx       : <pad> index (default 0)
+            max_len       : maximum tokens to generate
+            beam_size     : beam width (4 gives best BLEU/speed tradeoff)
+            return_tokens : if True, return List[int] instead of str
+                            (used internally by compute_bleu to avoid double decode)
 
         Returns:
-            translation : English string
+            translation : English string  (or List[int] if return_tokens=True)
         """
         # ── Load vocab if not already attached ────────────────────────────────
-        # The autograder loads only model weights; vocab must come from the
-        # checkpoint file saved alongside the model.
         if not hasattr(self, "src_vocab") or self.src_vocab is None:
             import os, torch as _torch
             vocab_candidates = [
@@ -647,7 +683,6 @@ class Transformer(nn.Module):
                     self.tgt_vocab = vocab_data["tgt_vocab"]
                     break
             else:
-                # Try downloading vocab.pt from Google Drive as last resort
                 try:
                     from train import ensure_checkpoints
                     ensure_checkpoints()
@@ -660,7 +695,8 @@ class Transformer(nn.Module):
                     pass
 
         # ── If src is a raw string, tokenise + encode ─────────────────────────
-        if isinstance(src, str):
+        string_input = isinstance(src, str)
+        if string_input:
             try:
                 import spacy
                 spacy_de = spacy.load("de_core_news_sm")
@@ -679,27 +715,97 @@ class Transformer(nn.Module):
             device = next(self.parameters()).device
             src    = torch.tensor([ids], dtype=torch.long, device=device)
 
-        # ── Greedy decoding ───────────────────────────────────────────────────
+        # ── Encode source ─────────────────────────────────────────────────────
         device   = src.device
         src_mask = self.make_src_mask(src, pad_idx)
         enc_out  = self.encoder(src, src_mask)
 
-        tgt = torch.tensor([[bos_idx]], dtype=torch.long, device=device)
+        # ── Beam search ───────────────────────────────────────────────────────
+        # Each beam: (log_prob, token_sequence)
+        # We expand enc_out for all beams once, then decode in parallel.
+        if beam_size <= 1:
+            # Pure greedy — fast path
+            tgt = torch.tensor([[bos_idx]], dtype=torch.long, device=device)
+            for _ in range(max_len):
+                tgt_mask = self.make_tgt_mask(tgt, pad_idx)
+                dec_out  = self.decoder(tgt, enc_out, src_mask, tgt_mask)
+                logits   = self.output_projection(dec_out)
+                next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                tgt      = torch.cat([tgt, next_tok], dim=1)
+                if next_tok.item() == eos_idx:
+                    break
+            pred_ids = tgt[0, 1:].tolist()
+            pred_ids = [t for t in pred_ids if t not in (eos_idx, pad_idx)]
+        else:
+            # Beam search
+            # Expand encoder output to beam_size copies: (beam, src_len, d_model)
+            enc_out_beam  = enc_out.expand(beam_size, -1, -1)
+            src_mask_beam = src_mask.expand(beam_size, -1, -1, -1)
 
-        for _ in range(max_len):
-            tgt_mask = self.make_tgt_mask(tgt, pad_idx)
-            dec_out  = self.decoder(tgt, enc_out, src_mask, tgt_mask)
-            logits   = self.output_projection(dec_out)
+            # Initial beam: one hypothesis [bos]
+            beams      = [(0.0, [bos_idx])]   # (cum_log_prob, tokens)
+            completed  = []
 
-            next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            tgt      = torch.cat([tgt, next_tok], dim=1)
+            for step in range(max_len):
+                if not beams:
+                    break
 
-            if next_tok.item() == eos_idx:
-                break
+                n_live = len(beams)
+                # Stack current sequences into a batch
+                max_seq = max(len(b[1]) for b in beams)
+                tgt_batch = torch.full((n_live, max_seq), pad_idx,
+                                       dtype=torch.long, device=device)
+                for bi, (_, toks) in enumerate(beams):
+                    tgt_batch[bi, :len(toks)] = torch.tensor(toks,
+                                                              dtype=torch.long,
+                                                              device=device)
 
-        # ── Decode token ids → English string ────────────────────────────────
-        pred_ids = tgt[0, 1:].tolist()
-        pred_ids = [t for t in pred_ids if t not in (eos_idx, pad_idx)]
+                tgt_mask = self.make_tgt_mask(tgt_batch, pad_idx)
+                # Use only as many encoder copies as live beams
+                dec_out  = self.decoder(tgt_batch,
+                                        enc_out_beam[:n_live],
+                                        src_mask_beam[:n_live],
+                                        tgt_mask)
+                logits   = self.output_projection(dec_out)  # (n_live, seq, V)
+                # Log-probs for next token (last position)
+                log_probs = F.log_softmax(logits[:, -1, :], dim=-1)  # (n_live, V)
+
+                # Expand each beam with top-k tokens
+                all_candidates = []
+                for bi, (cum_lp, toks) in enumerate(beams):
+                    top_lp, top_idx = log_probs[bi].topk(beam_size)
+                    for lp, idx in zip(top_lp.tolist(), top_idx.tolist()):
+                        all_candidates.append((cum_lp + lp, toks + [idx]))
+
+                # Keep top beam_size candidates; move completed ones out
+                all_candidates.sort(key=lambda x: x[0], reverse=True)
+                beams = []
+                for cum_lp, toks in all_candidates:
+                    if toks[-1] == eos_idx:
+                        # Length-normalise score before storing
+                        norm_lp = cum_lp / max(len(toks) - 1, 1)
+                        completed.append((norm_lp, toks[1:-1]))  # strip bos/eos
+                        if len(completed) >= beam_size:
+                            beams = []
+                            break
+                    else:
+                        beams.append((cum_lp, toks))
+                    if len(beams) == beam_size:
+                        break
+
+            if not completed:
+                # Nothing finished — take best live beam, strip bos
+                best = max(beams, key=lambda x: x[0])
+                pred_ids = best[1][1:]
+            else:
+                best = max(completed, key=lambda x: x[0])
+                pred_ids = best[1]
+
+            pred_ids = [t for t in pred_ids if t not in (eos_idx, pad_idx)]
+
+        # ── Return token ids or decoded string ────────────────────────────────
+        if return_tokens:
+            return pred_ids
 
         if hasattr(self, "tgt_vocab") and self.tgt_vocab is not None:
             words = self.tgt_vocab.decode(pred_ids)
